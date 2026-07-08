@@ -19,6 +19,7 @@ Usage:
   convert.py <session.jsonl> --no-messages    # omit prompt/response bodies (leaner, private)
 """
 import argparse, hashlib, json, os, sys, urllib.request, urllib.error
+from dataclasses import dataclass
 from datetime import datetime
 
 OTLP_ENDPOINT = "https://api.honeycomb.io/v1/traces"
@@ -107,9 +108,33 @@ def result_text(tool_result_block):
                          if isinstance(b, dict) and b.get("type") == "text")
     return json.dumps(c, default=str) if c is not None else ""
 
-# ---- core: transcript -> spans ---------------------------------------------
+# ---- core: transcript -> span tree -> OTLP ---------------------------------
+#
+# Two seams, so meaning is separable from wire format:
+#   build_span_tree(rows) -> ([SpanRecord], stats)   what happened (pure, testable)
+#   to_otlp(records, ...)  -> OTLP payload            how Honeycomb receives it
+# build_spans() composes them for callers that just want a payload.
+
+@dataclass
+class SpanRecord:
+    """One span, described in its own terms (semantic attributes, ns times) —
+    before any OTLP encoding. This is the test surface: assert on these."""
+    span_id: str
+    parent_id: str | None          # None == trace root
+    name: str
+    kind: int
+    start_ns: int
+    end_ns: int
+    attributes: dict               # raw values; encoded to OTLP later
+    status: dict | None = None
 
 def build_spans(rows, dataset, include_messages=True):
+    """Convenience composition: transcript rows -> (OTLP payload, stats)."""
+    records, stats = build_span_tree(rows, include_messages=include_messages)
+    stats["dataset"] = dataset
+    return to_otlp(records, stats["trace_id"], dataset), stats
+
+def build_span_tree(rows, include_messages=True):
     session_id = next((r.get("sessionId") for r in rows if r.get("sessionId")), "unknown")
     tid = trace_id(session_id)
     by_uuid = {r["uuid"]: r for r in rows if r.get("uuid")}
@@ -242,15 +267,12 @@ def build_spans(rows, dataset, include_messages=True):
                 ta["gen_ai.tool.call.arguments"] = truncate(tu.get("input", {}))
                 if res_block is not None:
                     ta["gen_ai.tool.call.result"] = truncate(result_text(res_block))
-            span = {
-                "traceId": tid, "spanId": span_id("tool:" + tu.get("id", tu_fallback(tu, a))),
-                "parentSpanId": chat_id, "name": sp_name, "kind": 1,
-                "startTimeUnixNano": str(tstart), "endTimeUnixNano": str(tend),
-                "attributes": attrs(ta),
-            }
-            if is_err:
-                span["status"] = {"code": 2, "message": "tool returned is_error"}
-            child_spans.append(span)
+            child_spans.append(SpanRecord(
+                span_id=span_id("tool:" + tu.get("id", tu_fallback(tu, a))),
+                parent_id=chat_id, name=sp_name, kind=1,
+                start_ns=tstart, end_ns=tend, attributes=ta,
+                status={"code": 2, "message": "tool returned is_error"} if is_err else None,
+            ))
 
         chat_end = max([a_ts or chat_start] + child_ends) if child_ends else (a_ts or chat_start)
         ca = {
@@ -281,15 +303,13 @@ def build_spans(rows, dataset, include_messages=True):
                 ca["gen_ai.input.messages"] = truncate(prompt_text(prompt_row))
             if assistant_text.strip():
                 ca["gen_ai.output.messages"] = truncate(assistant_text)
-        chat = {
-            "traceId": tid, "spanId": chat_id, "parentSpanId": chat_parent,
-            "name": f"chat {model}", "kind": 3,
-            "startTimeUnixNano": str(chat_start), "endTimeUnixNano": str(chat_end),
-            "attributes": attrs(ca),
-        }
+        chat_status = None
         if a.get("isApiErrorMessage") or a.get("error"):
-            chat["status"] = {"code": 2, "message": truncate(str(a.get("error") or "api error"), 300)}
-        spans.append(chat)
+            chat_status = {"code": 2, "message": truncate(str(a.get("error") or "api error"), 300)}
+        spans.append(SpanRecord(
+            span_id=chat_id, parent_id=chat_parent, name=f"chat {model}", kind=3,
+            start_ns=chat_start, end_ns=chat_end, attributes=ca, status=chat_status,
+        ))
         spans.extend(child_spans)
 
     prompts = [r for r in rows if is_user_prompt(r)]
@@ -313,14 +333,38 @@ def build_spans(rows, dataset, include_messages=True):
         "session.entrypoint": root_meta.get("entrypoint"),
         "duration_ms": int((t_end - t_start) / 1e6) if t_end else None,
     }
-    root = {
-        "traceId": tid, "spanId": root_id, "name": "invoke_agent claude-code", "kind": 1,
-        "startTimeUnixNano": str(t_start), "endTimeUnixNano": str(t_end),
-        "attributes": attrs(root_attrs),
-    }
-    spans.insert(0, root)
+    spans.insert(0, SpanRecord(
+        span_id=root_id, parent_id=None, name="invoke_agent claude-code", kind=1,
+        start_ns=t_start, end_ns=t_end, attributes=root_attrs,
+    ))
 
-    payload = {"resourceSpans": [{
+    stats = {
+        "session_id": session_id, "trace_id": tid,
+        "spans": len(spans), "turns": len(prompts), "chats": len(assistants),
+        "tools": tool_count, "tokens_in": tot_in, "tokens_out": tot_out,
+        "models": sorted(models),
+        "duration_s": round((t_end - t_start) / 1e9, 1) if t_end else 0,
+        "oldest_epoch": int(t_start / 1e9) if t_start else 0,
+        "newest_epoch": int(t_end / 1e9) if t_end else 0,
+    }
+    return spans, stats
+
+def to_otlp(records, trace_id, dataset):
+    """Encode SpanRecords into an OTLP/HTTP JSON payload for Honeycomb."""
+    spans = []
+    for r in records:
+        s = {"traceId": trace_id, "spanId": r.span_id}
+        if r.parent_id is not None:
+            s["parentSpanId"] = r.parent_id
+        s["name"] = r.name
+        s["kind"] = r.kind
+        s["startTimeUnixNano"] = str(r.start_ns)
+        s["endTimeUnixNano"] = str(r.end_ns)
+        s["attributes"] = attrs(r.attributes)
+        if r.status is not None:
+            s["status"] = r.status
+        spans.append(s)
+    return {"resourceSpans": [{
         "resource": {"attributes": attrs({
             "service.name": dataset, "gen_ai.system": GEN_AI_SYSTEM,
             "telemetry.sdk.name": "claude-code-trace-session",
@@ -331,16 +375,6 @@ def build_spans(rows, dataset, include_messages=True):
             "spans": spans,
         }],
     }]}
-    stats = {
-        "session_id": session_id, "trace_id": tid, "dataset": dataset,
-        "spans": len(spans), "turns": len(prompts), "chats": len(assistants),
-        "tools": tool_count, "tokens_in": tot_in, "tokens_out": tot_out,
-        "models": sorted(models),
-        "duration_s": round((t_end - t_start) / 1e9, 1) if t_end else 0,
-        "oldest_epoch": int(t_start / 1e9) if t_start else 0,
-        "newest_epoch": int(t_end / 1e9) if t_end else 0,
-    }
-    return payload, stats
 
 def tu_fallback(tu, a):
     return (tu.get("id") or "") + a.get("uuid", "")

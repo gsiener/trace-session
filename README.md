@@ -64,6 +64,19 @@ Spans carry the GenAI conventions: `gen_ai.operation.name` (`chat` / `execute_to
 - **Region:** the endpoint defaults to US (`api.honeycomb.io`). For EU, change `OTLP_ENDPOINT` in `convert.py` to `https://api.eu1.honeycomb.io/v1/traces`.
 - **Privacy:** use `--no-messages` to keep conversation content out of Honeycomb while still capturing the shape, tokens, and timings of a run.
 
+## Development
+
+The transcript-to-trace core is split at a `SpanRecord` seam so meaning is
+separable from wire format: `build_span_tree(rows) -> [SpanRecord]` builds the
+span tree (pure, testable), and `to_otlp(records, …)` encodes the OTLP payload.
+See [CONTEXT.md](CONTEXT.md) for the vocabulary.
+
+Tests assert on the span tree directly — no network, no OTLP spelunking:
+
+```bash
+cd trace-session && python3 -m unittest -v
+```
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
