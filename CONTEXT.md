@@ -25,7 +25,13 @@ them in code, commits, and future architecture reviews.
   so a fan-out reads as distinct agents rather than one blob. Sidechain turns
   nest under their spawning lane via `sourceToolUseID`.
 
-- **Session catalog** — the discoverable set of Transcripts plus the rules for
-  picking one (list / resolve a selector / current). Today this is spread
-  across several functions in `convert.py`; consolidating it is a known
-  deepening opportunity (see the architecture review).
+- **Session catalog** — `SessionCatalog`: the discoverable set of Transcripts
+  plus the rules for picking one — `list(limit)`, `resolve(selector)`,
+  `current()`. Selecting returns a **Resolution** (`found` / `ambiguous` /
+  `notfound`) rather than an untyped pair, so ambiguity is never guessed
+  through. Point it at a fixture directory (`dirs=`) to test without touching
+  `~/.claude`.
+
+- **Session** — one discoverable Transcript: cheap fields (id, mtime, size,
+  project) from the filename + stat; title/prompt/slug/branch/cwd filled by a
+  head-of-file `peek()` only when needed.

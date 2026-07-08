@@ -449,71 +449,104 @@ def peek(path, max_lines=300):
         pass
     return {"slug": slug, "title": title, "branch": branch, "cwd": cwd, "prompt": prompt}
 
-def list_sessions(all_projects, now, limit=25):
-    import glob
-    # stat everything first (cheap), sort by recency, then peek() only the top N
-    # so a huge history doesn't cost a full read per file.
-    files = []
-    for d in scan_dirs(all_projects):
-        for p in glob.glob(os.path.join(d, "*.jsonl")):
-            try: st = os.stat(p)
-            except OSError: continue
-            files.append((st.st_mtime, st.st_size, p, d))
-    files.sort(reverse=True)
-    return [_session_dict(p, mtime, size, d, now) for mtime, size, p, d in files[:limit]]
+@dataclass
+class Session:
+    """One discoverable transcript. Cheap fields come from the filename + stat;
+    title/prompt/slug/branch/cwd are filled by peek() only when needed."""
+    path: str
+    id: str                # filename minus ".jsonl" == the session id
+    mtime: float
+    size: int
+    project: str           # short project name
+    title: str | None = None
+    prompt: str | None = None
+    slug: str | None = None
+    branch: str | None = None
+    cwd: str | None = None
 
-def _session_dict(p, mtime, size, d, now):
-    return {"path": p, "mtime": mtime, "size": size,
-            "id": os.path.basename(p)[:-6],   # filename is the session id
-            "age": human_age(now - mtime) if now else "",
-            "project": os.path.basename(d).rsplit("-", 1)[-1], **peek(p)}
+    def age(self, now):
+        return human_age(now - self.mtime) if now else ""
 
-def _files(all_projects):
-    import glob
-    fs = []
-    for d in scan_dirs(all_projects):
-        for p in glob.glob(os.path.join(d, "*.jsonl")):
-            try: fs.append((os.stat(p).st_mtime, p, d))
-            except OSError: pass
-    fs.sort(reverse=True)
-    return fs  # list of (mtime, path, dir), newest first
+    @classmethod
+    def at(cls, path, peeked=False):
+        st = os.stat(path)
+        s = cls(path=path, id=os.path.basename(path)[:-6], mtime=st.st_mtime,
+                size=st.st_size,
+                project=os.path.basename(os.path.dirname(path)).rsplit("-", 1)[-1])
+        if peeked:
+            for k, v in peek(path).items():
+                setattr(s, k, v)
+        return s
 
-def current_session_path():
-    fs = _files(all_projects=False)
-    return fs[0][1] if fs else None
+@dataclass
+class Resolution:
+    """Outcome of resolving a selector. status: 'found' | 'ambiguous' | 'notfound'.
+    A typed result so the caller doesn't decode an untyped (path, hits) pair."""
+    status: str
+    session: "Session | None" = None
+    candidates: list | None = None
 
-def resolve_selector(sel, all_projects, now):
-    """sel may be a path, a session-id (or prefix), a slug (or prefix), or title substring.
-    Returns (path, None) on a unique hit, or (None, candidates) to report ambiguity/no-match."""
-    if os.path.exists(sel):
-        return sel, None
-    s = sel.lower()
-    # 1) session-id prefix — the filename IS the id, so this needs no file reads
-    by_id = [(m, p, d) for m, p, d in _files(all_projects)
-             if os.path.basename(p)[:-6].startswith(sel)]
-    if len(by_id) == 1:
-        return by_id[0][1], None
-    if len(by_id) > 1:  # ambiguous id — report the candidates, never guess
-        return None, [_session_dict(p, m, os.path.getsize(p), d, now) for m, p, d in by_id]
-    # 2) no id hit → fuzzy over title / slug only (deliberately NOT prompt bodies,
-    #    which match far too loosely — a stray digit would pick a random session)
-    sess = list_sessions(all_projects, now, limit=200)
-    hits = [x for x in sess if s in (x["title"] or "").lower()
-            or (x["slug"] or "").lower().startswith(s)]
-    if len(hits) == 1: return hits[0]["path"], None
-    return None, hits  # 0 or >1 → caller reports
+    @property
+    def found(self):
+        return self.status == "found"
 
-def print_table(sess, now):
-    if not sess:
+class SessionCatalog:
+    """The discoverable session transcripts + the rules for picking one, in one
+    place. Pass explicit `dirs` to point it at a fixture directory (tests);
+    otherwise it scans ~/.claude/projects (current project, or all)."""
+    def __init__(self, all_projects=False, now=0, dirs=None):
+        self._dirs = dirs if dirs is not None else scan_dirs(all_projects)
+        self.now = now
+
+    def _paths(self):
+        import glob
+        fs = []
+        for d in self._dirs:
+            for p in glob.glob(os.path.join(d, "*.jsonl")):
+                try: fs.append((os.stat(p).st_mtime, p))
+                except OSError: pass
+        fs.sort(reverse=True)
+        return [p for _, p in fs]   # newest first
+
+    def current(self):
+        ps = self._paths()
+        return ps[0] if ps else None
+
+    def list(self, limit=25):
+        # stat+sort is cheap; peek only the top N so a huge history stays fast
+        return [Session.at(p, peeked=True) for p in self._paths()[:limit]]
+
+    def resolve(self, selector):
+        """selector: a path, a session-id (or prefix), a slug (or prefix), or a
+        title substring. Returns a typed Resolution — never silently guesses."""
+        if os.path.exists(selector):
+            return Resolution("found", Session.at(selector))
+        # 1) session-id prefix — the filename IS the id, so this needs no reads
+        by_id = [p for p in self._paths() if os.path.basename(p)[:-6].startswith(selector)]
+        if len(by_id) == 1:
+            return Resolution("found", Session.at(by_id[0]))
+        if len(by_id) > 1:   # ambiguous id — report the candidates, never guess
+            return Resolution("ambiguous", candidates=[Session.at(p, peeked=True) for p in by_id])
+        # 2) no id hit → fuzzy over title / slug only (NOT prompt bodies, which
+        #    match far too loosely — a stray digit would pick a random session)
+        s = selector.lower()
+        hits = [x for x in self.list(limit=200)
+                if s in (x.title or "").lower() or (x.slug or "").lower().startswith(s)]
+        if len(hits) == 1:
+            return Resolution("found", hits[0])
+        return Resolution("ambiguous" if hits else "notfound", candidates=hits)
+
+def print_table(sessions, now):
+    if not sessions:
         print("no sessions found."); return
-    multi = len({s["project"] for s in sess}) > 1
+    multi = len({s.project for s in sessions}) > 1
     hdr = f'{"#":>2}  {"AGE":<9}  {"TITLE":<46}  {"ID":<8}  SIZE'
     if multi: hdr += "   PROJECT"
     print(hdr)
-    for i, s in enumerate(sess, 1):
-        label = (s["title"] or s["prompt"] or "?")[:46]
-        row = f'{i:>2}  {s["age"]:<9}  {label:<46}  {s["id"][:8]:<8}  {human_size(s["size"]):>6}'
-        if multi: row += f'   {s["project"]}'
+    for i, s in enumerate(sessions, 1):
+        label = (s.title or s.prompt or "?")[:46]
+        row = f'{i:>2}  {s.age(now):<9}  {label:<46}  {s.id[:8]:<8}  {human_size(s.size):>6}'
+        if multi: row += f'   {s.project}'
         print(row)
 
 # ---- send -------------------------------------------------------------------
@@ -556,20 +589,22 @@ def main():
     now = time.time()
 
     if args.list:
-        print_table(list_sessions(args.all, now), now)
+        print_table(SessionCatalog(args.all, now).list(), now)
         return
 
     if args.session:
-        path, hits = resolve_selector(args.session, args.all, now)
-        if not path:
-            if hits:
-                print(f"'{args.session}' matched {len(hits)} sessions — be more specific:\n", file=sys.stderr)
-                print_table(hits, now)
+        res = SessionCatalog(args.all, now).resolve(args.session)
+        if res.found:
+            path = res.session.path
+        else:
+            if res.candidates:
+                print(f"'{args.session}' matched {len(res.candidates)} sessions — be more specific:\n", file=sys.stderr)
+                print_table(res.candidates, now)
             else:
                 print(f"no session matched '{args.session}'. try --list (or --all).", file=sys.stderr)
             sys.exit(1)
     else:
-        path = current_session_path()
+        path = SessionCatalog(all_projects=False, now=now).current()
         if not path:
             print("no current session found. pass a path/slug, or --list.", file=sys.stderr); sys.exit(1)
         if project_dir_for_cwd() is None:

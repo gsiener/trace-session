@@ -5,6 +5,10 @@ Run:  python3 -m unittest -v   (from this directory)
 These assert on SpanRecords — the point of the build_span_tree / to_otlp split.
 No filesystem, no network: build a fixture transcript, check the tree.
 """
+import json
+import os
+import shutil
+import tempfile
 import unittest
 import convert
 
@@ -155,6 +159,68 @@ class OtlpEncoding(unittest.TestCase):
         root = next(s for s in spans if s["name"] == "invoke_agent claude-code")
         self.assertNotIn("parentSpanId", root)
         self.assertIn("parentSpanId", chat)
+
+
+def write_session(directory, sid, title=None, prompt=None, mtime=None):
+    p = os.path.join(directory, f"{sid}.jsonl")
+    lines = []
+    if title:
+        lines.append({"type": "ai-title", "aiTitle": title, "sessionId": sid})
+    if prompt:
+        lines.append({"type": "user", "uuid": "u1", "parentUuid": None,
+                      "sessionId": sid, "message": {"role": "user", "content": prompt}})
+    with open(p, "w") as f:
+        for l in lines:
+            f.write(json.dumps(l) + "\n")
+    if mtime:
+        os.utime(p, (mtime, mtime))
+    return p
+
+
+class Catalog(unittest.TestCase):
+    """SessionCatalog resolves against a fixture directory — no ~/.claude, no network."""
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        write_session(self.tmp, "aaa10000-0000-0000-0000-000000000001",
+                      title="Build the widget", prompt="build it", mtime=1000)
+        write_session(self.tmp, "aaa20000-0000-0000-0000-000000000002",
+                      title="Debug the pipeline", prompt="debug it", mtime=2000)
+        write_session(self.tmp, "bbb30000-0000-0000-0000-000000000003",
+                      title="Write the memo", prompt="write it", mtime=3000)
+        self.cat = convert.SessionCatalog(dirs=[self.tmp], now=9999)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_list_newest_first_with_metadata(self):
+        sessions = self.cat.list()
+        self.assertEqual([s.id[:6] for s in sessions], ["bbb300", "aaa200", "aaa100"])
+        self.assertEqual(sessions[0].title, "Write the memo")
+
+    def test_current_is_newest(self):
+        self.assertTrue(self.cat.current().endswith("000000000003.jsonl"))
+
+    def test_resolve_unique_id_prefix(self):
+        r = self.cat.resolve("bbb3")
+        self.assertEqual(r.status, "found")
+        self.assertTrue(r.found)
+        self.assertEqual(r.session.id[:4], "bbb3")
+
+    def test_resolve_ambiguous_id_reports_candidates(self):
+        r = self.cat.resolve("aaa")
+        self.assertEqual(r.status, "ambiguous")
+        self.assertEqual(len(r.candidates), 2)
+
+    def test_resolve_by_title_substring(self):
+        r = self.cat.resolve("pipeline")
+        self.assertEqual(r.status, "found")
+        self.assertEqual(r.session.id[:6], "aaa200")
+
+    def test_resolve_notfound(self):
+        r = self.cat.resolve("nonexistent-xyz")
+        self.assertEqual(r.status, "notfound")
+        self.assertFalse(r.found)
+        self.assertEqual(r.candidates, [])
 
 
 if __name__ == "__main__":
