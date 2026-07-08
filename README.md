@@ -46,7 +46,6 @@ With no argument it traces the **current** session (the most recently written tr
 | Flag | Effect |
 |------|--------|
 | `--send` | POST to Honeycomb (default is a dry run) |
-| `--verify` | After sending, query the trace back to confirm it landed (needs `HONEYCOMB_QUERY_KEY`) |
 | `--list` | Print a numbered table of recent sessions and exit |
 | `--all` | Scan every project, not just the current one |
 | `--dataset <name>` | Target dataset / `service.name` (default `claude-code-sessions`) |

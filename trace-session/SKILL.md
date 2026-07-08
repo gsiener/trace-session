@@ -65,13 +65,22 @@ Send **once** per session (see the append-only note above).
 Options:
 - `--dataset <name>` — target dataset / `service.name` (default `claude-code-sessions`; env `HONEYCOMB_DATASET` also works).
 - `--no-messages` — omit prompt/response/tool bodies (leaner + keeps content out of Honeycomb; keeps structure + tokens + timings).
-- `--verify` — after sending, query the trace back and report the span count landed. Needs `HONEYCOMB_QUERY_KEY` (a config key with *Run Queries*); skips with a note if it's absent.
 
 **Token accounting:** `gen_ai.usage.input_tokens` is reported as *total context* (uncached + cache-read + cache-creation), because Anthropic's raw `input_tokens` is only the uncached delta (often ~2) and would make the Timeline's token panels read near-zero. The raw value is preserved as `gen_ai.usage.uncached_input_tokens`. Prompts/responses are set as span **attributes** (`gen_ai.input.messages` / `gen_ai.output.messages`) so they render in the Agent Timeline's Messages panel.
 
-### 4. Point the user at the trace
+### 4. Verify it landed (via the Honeycomb MCP)
 
-After a successful send, print the dataset name and `trace.trace_id`. The user finds it in Honeycomb: open the dataset → **Agent Timeline** (or query `trace.trace_id = <id>` for the raw waterfall). Do not fabricate a deep-link URL — the team/environment slug isn't known from the key.
+After a successful send, confirm the trace is queryable — don't make the user eyeball the UI. Use the connected **Honeycomb MCP** (assume it's available): call `run_query` on the target dataset with a `COUNT`, filtered to `trace.trace_id = <id>`, over a time range covering the session's span window (the send output prints `oldest → newest`; widen a bit on each side). Then:
+
+- **count ≈ spans sent** → confirmed; report it.
+- **count > spans sent** → this trace was sent before; warn about duplicate spans (append-only — see above).
+- **count 0** → ingest can lag a few seconds; retry once. Still 0 → the key's environment likely doesn't match the dataset, or the time window is off.
+
+Breaking the count down by `gen_ai.operation.name` is a nice confirmation (chat / execute_tool / invoke_agent all present).
+
+### 5. Point the user at the trace
+
+Give the dataset name and `trace.trace_id`. The user opens the dataset → **Agent Timeline** (or queries `trace.trace_id = <id>` for the raw waterfall). Prefer the `query_url` the MCP returns as the shareable link; don't fabricate one from guessed team/env slugs.
 
 **Tell them to widen the time range.** Spans are backdated to when the work actually happened, so a session from yesterday/last week will NOT appear in Honeycomb's default "last 2 hours" view — it looks like nothing sent. The send output prints the span time range; point the user at it and have them set the query window to cover it.
 

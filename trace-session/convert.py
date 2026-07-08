@@ -500,44 +500,9 @@ def send(payload, api_key, dataset):
     except urllib.error.URLError as e:
         return None, str(e)
 
-# ---- verify (query the trace back) -----------------------------------------
-
-QUERY_BASE = "https://api.honeycomb.io"  # Query Data API; mirror OTLP_ENDPOINT region for EU
-
-def _api(url, key, body):
-    data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(
-        url, data=data, method="POST" if body is not None else "GET",
-        headers={"X-Honeycomb-Team": key, "Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            return r.status, json.loads(r.read().decode() or "{}")
-    except urllib.error.HTTPError as e:
-        return e.code, {"error": e.read().decode()}
-    except (urllib.error.URLError, json.JSONDecodeError) as e:
-        return None, {"error": str(e)}
-
-def verify(trace_id, dataset, query_key, start_epoch, end_epoch):
-    """Count spans for this trace via the Query Data API. Returns (count, error)."""
-    import time
-    spec = {"calculations": [{"op": "COUNT"}],
-            "filters": [{"column": "trace.trace_id", "op": "=", "value": trace_id}],
-            "start_time": int(start_epoch) - 3600, "end_time": int(end_epoch) + 3600}
-    st, q = _api(f"{QUERY_BASE}/1/queries/{dataset}", query_key, spec)
-    if st != 200 or "id" not in q:
-        return None, f"create-query failed (HTTP {st}): {q.get('error', q)}"
-    st, r = _api(f"{QUERY_BASE}/1/query_results/{dataset}", query_key,
-                 {"query_id": q["id"], "disable_series": True})
-    if st not in (200, 201) or "id" not in r:
-        return None, f"run-query failed (HTTP {st}): {r.get('error', r)}"
-    rid = r["id"]
-    for _ in range(12):  # poll up to ~12s
-        st, res = _api(f"{QUERY_BASE}/1/query_results/{dataset}/{rid}", query_key, None)
-        if st == 200 and res.get("complete"):
-            rows = res.get("data", {}).get("results", [])
-            return (rows[0].get("data", {}).get("COUNT", 0) if rows else 0), None
-        time.sleep(1)
-    return None, "timed out waiting for the query result"
+# Verification (querying the trace back) is done by the skill orchestrator via
+# the Honeycomb MCP after a send — see SKILL.md. It isn't reimplemented here so
+# the script stays dependency- and key-free (no separate query key to manage).
 
 # ---- main -------------------------------------------------------------------
 
@@ -550,9 +515,6 @@ def main():
     ap.add_argument("-l", "--list", action="store_true", help="list recent sessions and exit")
     ap.add_argument("--all", action="store_true", help="scan all projects, not just the current one")
     ap.add_argument("--send", action="store_true", help="POST to Honeycomb (default: dry run)")
-    ap.add_argument("--verify", action="store_true",
-                    help="after sending, query the trace back to confirm it landed "
-                         "(needs HONEYCOMB_QUERY_KEY — a config key with Run Queries)")
     ap.add_argument("--dataset", default=os.environ.get("HONEYCOMB_DATASET", DEFAULT_DATASET))
     ap.add_argument("--no-messages", action="store_true", help="omit prompt/response/tool bodies")
     ap.add_argument("--out", help="where to write the OTLP payload (dry run)")
@@ -625,26 +587,6 @@ def main():
             json.dump(payload, f, indent=2)
         print(f"\n(dry run — nothing sent) OTLP payload written to:\n  {out}")
         print("  re-run with --send and HONEYCOMB_API_KEY set to ship it.")
-
-    if args.verify:
-        qkey = os.environ.get("HONEYCOMB_QUERY_KEY")
-        if not qkey:
-            print("\n(skip --verify) set HONEYCOMB_QUERY_KEY to a Honeycomb config key with "
-                  "'Run Queries' to auto-confirm the trace landed.", file=sys.stderr)
-        else:
-            print("\nverifying (querying the trace back)…")
-            count, err = verify(stats["trace_id"], args.dataset, qkey,
-                                stats["oldest_epoch"], stats["newest_epoch"])
-            if err:
-                print(f"  ? could not verify: {err}", file=sys.stderr)
-            elif count and count >= stats["spans"]:
-                print(f"  ✓ confirmed {count} spans in '{args.dataset}' for this trace.")
-            elif count:
-                print(f"  ~ found {count} spans (sent {stats['spans']}). "
-                      f"If higher than sent, this trace was sent before — you have duplicates.")
-            else:
-                print(f"  ✗ 0 spans found — ingest may lag a few seconds, or the key's "
-                      f"environment doesn't match the dataset. Re-check shortly.")
 
 if __name__ == "__main__":
     main()
