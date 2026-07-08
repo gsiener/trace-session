@@ -46,6 +46,7 @@ With no argument it traces the **current** session (the most recently written tr
 | Flag | Effect |
 |------|--------|
 | `--send` | POST to Honeycomb (default is a dry run) |
+| `--verify` | After sending, query the trace back to confirm it landed (needs `HONEYCOMB_QUERY_KEY`) |
 | `--list` | Print a numbered table of recent sessions and exit |
 | `--all` | Scan every project, not just the current one |
 | `--dataset <name>` | Target dataset / `service.name` (default `claude-code-sessions`) |
@@ -53,7 +54,9 @@ With no argument it traces the **current** session (the most recently written tr
 
 ## What lands in Honeycomb
 
-Spans carry the GenAI conventions: `gen_ai.operation.name` (`chat` / `execute_tool` / `invoke_agent`), `gen_ai.conversation.id` (the session id), `gen_ai.agent.name` / `type` / `description`, `gen_ai.request/response.model`, `gen_ai.usage.{input,output,cache_read,cache_creation}_tokens`, `gen_ai.response.finish_reasons`, and `gen_ai.tool.name/call.id/call.arguments/call.result`. With bodies included, prompts and responses ride along as `gen_ai.input.messages` / `gen_ai.output.messages` span events. Tool errors set the span status to ERROR.
+Spans carry the GenAI conventions: `gen_ai.operation.name` (`chat` / `execute_tool` / `invoke_agent`), `gen_ai.conversation.id` (the session id), `gen_ai.agent.name` / `type` / `description`, `gen_ai.request/response.model`, `gen_ai.usage.{input,output,cache_read,cache_creation}_tokens`, `gen_ai.response.finish_reasons`, and `gen_ai.tool.name/call.id/call.arguments/call.result`. With bodies included, prompts and responses ride along as `gen_ai.input.messages` / `gen_ai.output.messages` span **attributes** so they render in the Agent Timeline's Messages panel. Tool errors set the span status to ERROR.
+
+`gen_ai.usage.input_tokens` is reported as *total context* (uncached + cache-read + cache-creation) so the token panels are meaningful — Anthropic's raw `input_tokens` counts only the uncached delta (often ~2). The raw value is kept as `gen_ai.usage.uncached_input_tokens`.
 
 ## Notes
 

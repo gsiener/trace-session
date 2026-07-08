@@ -65,6 +65,9 @@ Send **once** per session (see the append-only note above).
 Options:
 - `--dataset <name>` — target dataset / `service.name` (default `claude-code-sessions`; env `HONEYCOMB_DATASET` also works).
 - `--no-messages` — omit prompt/response/tool bodies (leaner + keeps content out of Honeycomb; keeps structure + tokens + timings).
+- `--verify` — after sending, query the trace back and report the span count landed. Needs `HONEYCOMB_QUERY_KEY` (a config key with *Run Queries*); skips with a note if it's absent.
+
+**Token accounting:** `gen_ai.usage.input_tokens` is reported as *total context* (uncached + cache-read + cache-creation), because Anthropic's raw `input_tokens` is only the uncached delta (often ~2) and would make the Timeline's token panels read near-zero. The raw value is preserved as `gen_ai.usage.uncached_input_tokens`. Prompts/responses are set as span **attributes** (`gen_ai.input.messages` / `gen_ai.output.messages`) so they render in the Agent Timeline's Messages panel.
 
 ### 4. Point the user at the trace
 

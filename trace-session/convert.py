@@ -146,6 +146,19 @@ def build_spans(rows, dataset, include_messages=True):
             r = by_uuid.get(r.get("parentUuid"))
         return None
 
+    def triggering_prompt(a):
+        """The user prompt that triggered this chat, if any. The immediate parent is
+        usually an injected 'attachment' row, so skip those (and meta) — but stop at
+        a tool-result/assistant, since a mid-turn chat's input is the tool result,
+        not the original prompt."""
+        r = by_uuid.get(a.get("parentUuid"))
+        for _ in range(5):
+            if not r: return None
+            if r.get("type") == "attachment" or r.get("isMeta"):
+                r = by_uuid.get(r.get("parentUuid")); continue
+            return r if is_user_prompt(r) else None
+        return None
+
     root_meta = next((r for r in rows if r.get("cwd")), {})
     root_id = span_id("root:" + session_id)
     spans = []
@@ -160,10 +173,17 @@ def build_spans(rows, dataset, include_messages=True):
             continue
         models.add(model)
         usage = m.get("usage", {}) or {}
-        tot_in    += usage.get("input_tokens", 0) or 0
+        # Anthropic reports input_tokens as the UNCACHED delta only (often tiny);
+        # real context = uncached + cache-read + cache-creation. Sum them so the
+        # Agent Timeline token panels reflect true context size (matches hny).
+        uncached_in = usage.get("input_tokens")
+        cache_r = usage.get("cache_read_input_tokens") or 0
+        cache_w = usage.get("cache_creation_input_tokens") or 0
+        context_in = (uncached_in + cache_r + cache_w) if uncached_in is not None else None
+        tot_in    += context_in or 0
         tot_out   += usage.get("output_tokens", 0) or 0
-        tot_cache_r += usage.get("cache_read_input_tokens", 0) or 0
-        tot_cache_w += usage.get("cache_creation_input_tokens", 0) or 0
+        tot_cache_r += cache_r
+        tot_cache_w += cache_w
 
         parent = by_uuid.get(a.get("parentUuid"))
         a_ts = nanos(a.get("timestamp"))
@@ -240,7 +260,8 @@ def build_spans(rows, dataset, include_messages=True):
             "gen_ai.agent.name": agent_name,
             "gen_ai.request.model": model,
             "gen_ai.response.model": model,
-            "gen_ai.usage.input_tokens": usage.get("input_tokens"),
+            "gen_ai.usage.input_tokens": context_in,                 # total context (uncached + cache) — for Timeline fidelity
+            "gen_ai.usage.uncached_input_tokens": uncached_in,       # raw semconv input_tokens, preserved
             "gen_ai.usage.output_tokens": usage.get("output_tokens"),
             "gen_ai.usage.cache_read_input_tokens": usage.get("cache_read_input_tokens"),
             "gen_ai.usage.cache_creation_input_tokens": usage.get("cache_creation_input_tokens"),
@@ -251,23 +272,21 @@ def build_spans(rows, dataset, include_messages=True):
             "tool.count": len(tool_uses),
             "session.is_sidechain": sidechain,
         }
+        # Messages ride as span ATTRIBUTES (not events) so Honeycomb's Agent
+        # Timeline renders them in the span's Messages panel, not a separate
+        # Span Events tab.
+        if include_messages:
+            prompt_row = triggering_prompt(a)
+            if prompt_row:
+                ca["gen_ai.input.messages"] = truncate(prompt_text(prompt_row))
+            if assistant_text.strip():
+                ca["gen_ai.output.messages"] = truncate(assistant_text)
         chat = {
             "traceId": tid, "spanId": chat_id, "parentSpanId": chat_parent,
             "name": f"chat {model}", "kind": 3,
             "startTimeUnixNano": str(chat_start), "endTimeUnixNano": str(chat_end),
-            "attributes": attrs(ca), "events": [],
+            "attributes": attrs(ca),
         }
-        if include_messages:
-            if parent and is_user_prompt(parent):
-                chat["events"].append({
-                    "timeUnixNano": str(chat_start), "name": "gen_ai.input.messages",
-                    "attributes": attrs({"gen_ai.input.messages": truncate(prompt_text(parent))}),
-                })
-            if assistant_text.strip():
-                chat["events"].append({
-                    "timeUnixNano": str(a_ts or chat_end), "name": "gen_ai.output.messages",
-                    "attributes": attrs({"gen_ai.output.messages": truncate(assistant_text)}),
-                })
         if a.get("isApiErrorMessage") or a.get("error"):
             chat["status"] = {"code": 2, "message": truncate(str(a.get("error") or "api error"), 300)}
         spans.append(chat)
@@ -481,6 +500,45 @@ def send(payload, api_key, dataset):
     except urllib.error.URLError as e:
         return None, str(e)
 
+# ---- verify (query the trace back) -----------------------------------------
+
+QUERY_BASE = "https://api.honeycomb.io"  # Query Data API; mirror OTLP_ENDPOINT region for EU
+
+def _api(url, key, body):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(
+        url, data=data, method="POST" if body is not None else "GET",
+        headers={"X-Honeycomb-Team": key, "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status, json.loads(r.read().decode() or "{}")
+    except urllib.error.HTTPError as e:
+        return e.code, {"error": e.read().decode()}
+    except (urllib.error.URLError, json.JSONDecodeError) as e:
+        return None, {"error": str(e)}
+
+def verify(trace_id, dataset, query_key, start_epoch, end_epoch):
+    """Count spans for this trace via the Query Data API. Returns (count, error)."""
+    import time
+    spec = {"calculations": [{"op": "COUNT"}],
+            "filters": [{"column": "trace.trace_id", "op": "=", "value": trace_id}],
+            "start_time": int(start_epoch) - 3600, "end_time": int(end_epoch) + 3600}
+    st, q = _api(f"{QUERY_BASE}/1/queries/{dataset}", query_key, spec)
+    if st != 200 or "id" not in q:
+        return None, f"create-query failed (HTTP {st}): {q.get('error', q)}"
+    st, r = _api(f"{QUERY_BASE}/1/query_results/{dataset}", query_key,
+                 {"query_id": q["id"], "disable_series": True})
+    if st not in (200, 201) or "id" not in r:
+        return None, f"run-query failed (HTTP {st}): {r.get('error', r)}"
+    rid = r["id"]
+    for _ in range(12):  # poll up to ~12s
+        st, res = _api(f"{QUERY_BASE}/1/query_results/{dataset}/{rid}", query_key, None)
+        if st == 200 and res.get("complete"):
+            rows = res.get("data", {}).get("results", [])
+            return (rows[0].get("data", {}).get("COUNT", 0) if rows else 0), None
+        time.sleep(1)
+    return None, "timed out waiting for the query result"
+
 # ---- main -------------------------------------------------------------------
 
 def main():
@@ -492,6 +550,9 @@ def main():
     ap.add_argument("-l", "--list", action="store_true", help="list recent sessions and exit")
     ap.add_argument("--all", action="store_true", help="scan all projects, not just the current one")
     ap.add_argument("--send", action="store_true", help="POST to Honeycomb (default: dry run)")
+    ap.add_argument("--verify", action="store_true",
+                    help="after sending, query the trace back to confirm it landed "
+                         "(needs HONEYCOMB_QUERY_KEY — a config key with Run Queries)")
     ap.add_argument("--dataset", default=os.environ.get("HONEYCOMB_DATASET", DEFAULT_DATASET))
     ap.add_argument("--no-messages", action="store_true", help="omit prompt/response/tool bodies")
     ap.add_argument("--out", help="where to write the OTLP payload (dry run)")
@@ -545,13 +606,13 @@ def main():
     if args.send:
         status, resp = send(payload, os.environ["HONEYCOMB_API_KEY"], args.dataset)
         if status == 200:
-            import datetime
-            oldest = datetime.datetime.utcfromtimestamp(stats["oldest_epoch"]).strftime("%Y-%m-%d %H:%M")
-            newest = datetime.datetime.utcfromtimestamp(stats["newest_epoch"]).strftime("%Y-%m-%d %H:%M")
+            from datetime import datetime, timezone
+            fmt = lambda e: datetime.fromtimestamp(e, timezone.utc).strftime("%Y-%m-%d %H:%M")
             print(f"\n✓ sent {stats['spans']} spans to Honeycomb dataset '{stats['dataset']}'")
             print(f"  find it: dataset '{stats['dataset']}', filter trace.trace_id = {stats['trace_id']}")
             print(f"  heads-up: spans are backdated to when they happened "
-                  f"({oldest} → {newest} UTC), so set your Honeycomb time range to cover that")
+                  f"({fmt(stats['oldest_epoch'])} → {fmt(stats['newest_epoch'])} UTC), so set your "
+                  f"Honeycomb time range to cover that")
             print(f"           (the default 'last 2 hours' will look empty).")
             print(f"  send once only — re-sending appends duplicate spans to this trace.")
         else:
@@ -564,6 +625,26 @@ def main():
             json.dump(payload, f, indent=2)
         print(f"\n(dry run — nothing sent) OTLP payload written to:\n  {out}")
         print("  re-run with --send and HONEYCOMB_API_KEY set to ship it.")
+
+    if args.verify:
+        qkey = os.environ.get("HONEYCOMB_QUERY_KEY")
+        if not qkey:
+            print("\n(skip --verify) set HONEYCOMB_QUERY_KEY to a Honeycomb config key with "
+                  "'Run Queries' to auto-confirm the trace landed.", file=sys.stderr)
+        else:
+            print("\nverifying (querying the trace back)…")
+            count, err = verify(stats["trace_id"], args.dataset, qkey,
+                                stats["oldest_epoch"], stats["newest_epoch"])
+            if err:
+                print(f"  ? could not verify: {err}", file=sys.stderr)
+            elif count and count >= stats["spans"]:
+                print(f"  ✓ confirmed {count} spans in '{args.dataset}' for this trace.")
+            elif count:
+                print(f"  ~ found {count} spans (sent {stats['spans']}). "
+                      f"If higher than sent, this trace was sent before — you have duplicates.")
+            else:
+                print(f"  ✗ 0 spans found — ingest may lag a few seconds, or the key's "
+                      f"environment doesn't match the dataset. Re-check shortly.")
 
 if __name__ == "__main__":
     main()
